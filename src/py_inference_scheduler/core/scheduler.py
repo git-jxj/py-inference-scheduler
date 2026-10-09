@@ -40,7 +40,8 @@ logger = logging.getLogger(__name__)
 class Scheduler:
     """Route requests using the latest successfully loaded configuration.
 
-    Failed file reloads retain the previous configuration and are retried on the
+    Failed file reloads retain the previous configuration. Invalid contents are
+    retried when the file changes; missing or unreadable files are retried on the
     next request. Initial configuration errors still propagate to the caller.
     """
 
@@ -91,8 +92,12 @@ class Scheduler:
         mtime = pathlib.Path(self.config_path).stat().st_mtime
         if mtime > self.last_mtime:
             print(f"Reloading scheduler config from {self.config_path}")
-            with pathlib.Path(self.config_path).open(encoding="utf-8") as f:
-                config_dict = yaml.safe_load(f)
+            config_text = pathlib.Path(self.config_path).read_text(encoding="utf-8")
+            # Once a fallback exists, try each readable version only once. Keep
+            # retrying initial loads and transient file-access failures.
+            if hasattr(self, "profiles") and hasattr(self, "profile_handler"):
+                self.last_mtime = mtime
+            config_dict = yaml.safe_load(config_text)
             if not isinstance(config_dict, dict):
                 raise ValueError("Parsed configuration is not a valid dictionary.")
             config = SchedulerConfig.from_dict(config_dict)

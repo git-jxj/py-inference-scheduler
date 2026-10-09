@@ -13,6 +13,10 @@
 # limitations under the License.
 
 
+import os
+import textwrap
+from pathlib import Path
+
 import pytest
 
 from py_inference_scheduler import Scheduler, SchedulerConfig
@@ -124,13 +128,18 @@ def test_filter_scorer_picker_combined():
 
 @pytest.mark.parametrize("replacement", [None, "profiles: [", "profiles: {}"])
 def test_reload_error_keeps_last_valid_config(tmp_path, caplog, replacement):
-    import os
-
     config_path = tmp_path / "scheduler.yaml"
-    config = (
-        "profile_handler:\n  type: single_profile\n"
-        "profiles:\n  default:\n    filters:\n"
-        "      - type: simple\n        key: zone\n        value: a\n"
+    config = textwrap.dedent(
+        """
+        profile_handler:
+          type: single_profile
+        profiles:
+          default:
+            filters:
+              - type: simple
+                key: zone
+                value: a
+        """
     )
     config_path.write_text(config, encoding="utf-8")
     scheduler = Scheduler(config_path=str(config_path))
@@ -149,6 +158,11 @@ def test_reload_error_keeps_last_valid_config(tmp_path, caplog, replacement):
     assert scheduler.run(request, candidates)[0].endpoint.name == "a"
     assert "keeping the last valid configuration" in caplog.text
 
+    if replacement is not None:
+        caplog.clear()
+        assert scheduler.run(request, candidates)[0].endpoint.name == "a"
+        assert "keeping the last valid configuration" not in caplog.text
+
     config_path.write_text(config.replace("value: a", "value: b"), encoding="utf-8")
     os.utime(config_path, (scheduler.last_mtime + 2, scheduler.last_mtime + 2))
     assert scheduler.run(request, candidates)[0].endpoint.name == "b"
@@ -160,5 +174,42 @@ def test_initial_config_error_is_not_suppressed(tmp_path, content):
     if content is not None:
         config_path.write_text(content, encoding="utf-8")
     scheduler = Scheduler(config_path=str(config_path))
-    with pytest.raises((FileNotFoundError, ValueError)):
-        scheduler.run(LLMRequest(request_id="r", target_model=None), [Endpoint(name="a")])
+    for _ in range(2):
+        with pytest.raises((FileNotFoundError, ValueError)):
+            scheduler.run(LLMRequest(request_id="r", target_model=None), [Endpoint(name="a")])
+
+
+def test_unreadable_reload_retries_without_new_mtime(tmp_path, monkeypatch, caplog):
+    config_path = tmp_path / "scheduler.yaml"
+    config = textwrap.dedent(
+        """
+        profile_handler:
+          type: single_profile
+        profiles:
+          default:
+            filters:
+              - type: simple
+                key: zone
+                value: a
+        """
+    )
+    config_path.write_text(config, encoding="utf-8")
+    scheduler = Scheduler(config_path=str(config_path))
+    request = LLMRequest(request_id="r", target_model=None)
+    candidates = [
+        Endpoint(name="a", attributes={"zone": "a"}),
+        Endpoint(name="b", attributes={"zone": "b"}),
+    ]
+    assert scheduler.run(request, candidates)[0].endpoint.name == "a"
+
+    config_path.write_text(config.replace("value: a", "value: b"), encoding="utf-8")
+    os.utime(config_path, (scheduler.last_mtime + 1, scheduler.last_mtime + 1))
+
+    def fail_open(*args, **kwargs):
+        raise PermissionError("configuration is temporarily unreadable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", fail_open)
+        assert scheduler.run(request, candidates)[0].endpoint.name == "a"
+    assert "keeping the last valid configuration" in caplog.text
+    assert scheduler.run(request, candidates)[0].endpoint.name == "b"
